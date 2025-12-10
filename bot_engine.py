@@ -84,7 +84,7 @@ class Backtester:
         finally:
             await exchange.close()
 
-    async def run(self):
+async def run(self):
         logger.info(f"Running backtest for {self.pair}...")
         ohlcv = await self.fetch_historical_data()
         
@@ -96,6 +96,10 @@ class Backtester:
         
         balance_usdt = self.initial_balance
         balance_asset = 0
+        
+        # ✅ NEW: Track accumulators
+        cumulative_grid_profit = 0 
+        
         trade_history = []
         chart_data = []
         
@@ -108,6 +112,7 @@ class Backtester:
             action = None
             
             for i, level in enumerate(grid_levels):
+                # BUY LOGIC
                 if low < level and not active_grids[i]:
                     if balance_usdt >= investment_per_grid:
                         amount = investment_per_grid / level
@@ -119,31 +124,48 @@ class Backtester:
                             "time": date_str, "type": "Buy", "price": level, "amount": amount, "profit": 0
                         })
 
+                # SELL LOGIC
                 elif high > (level + step) and active_grids[i]:
                     if balance_asset > 0:
                         amount = investment_per_grid / level 
                         revenue = amount * (level + step)
+                        
+                        # Calculate profit for this specific grid trade
                         profit = revenue - investment_per_grid
+                        
                         balance_usdt += revenue
                         balance_asset -= amount
+                        
+                        # ✅ NEW: Add to cumulative grid profit
+                        cumulative_grid_profit += profit
+                        
                         active_grids[i] = False
                         action = 'sell'
                         trade_history.append({
                             "time": date_str, "type": "Sell", "price": level + step, "amount": amount, "profit": profit
                         })
 
-            current_value = balance_usdt + (balance_asset * close)
+            # ✅ NEW: Accurate values for every timeframe
+            current_asset_value = balance_asset * close
+            total_equity = balance_usdt + current_asset_value
+            
             chart_data.append({
-                "date": date_str, "price": close, "value": current_value, "action": action
+                "date": date_str, 
+                "price": close, 
+                "totalValue": total_equity, 
+                "assetValue": current_asset_value, # Fluctuates with price
+                "gridProfit": cumulative_grid_profit, # Only goes UP when selling
+                "action": action
             })
 
-        total_profit = current_value - self.initial_balance
+        total_profit = total_equity - self.initial_balance
         roi = (total_profit / self.initial_balance) * 100
         
         return {
             "status": "success",
             "stats": {
                 "totalProfit": round(total_profit, 2),
+                "gridProfit": round(cumulative_grid_profit, 2), # Send final grid profit
                 "roi": round(roi, 2),
                 "totalTrades": len(trade_history)
             },
