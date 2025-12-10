@@ -34,7 +34,7 @@ class BacktestConfig(BaseModel):
     exchange: str = 'binance'
     pair: str = 'BTC/USDT'
     startDate: str  
-    endDate: str    # ✅ Added End Date
+    endDate: str    
     capital: float
     upperPrice: float
     lowerPrice: float
@@ -48,7 +48,7 @@ class Backtester:
         self.pair = config.pair
         self.timeframe = '1h' 
         self.start_date = config.startDate
-        self.end_date = config.endDate # Use this
+        self.end_date = config.endDate 
         self.initial_balance = config.capital
         self.upper_price = config.upperPrice
         self.lower_price = config.lowerPrice
@@ -84,7 +84,7 @@ class Backtester:
         finally:
             await exchange.close()
 
-async def run(self):
+    async def run(self):
         logger.info(f"Running backtest for {self.pair}...")
         ohlcv = await self.fetch_historical_data()
         
@@ -98,7 +98,7 @@ async def run(self):
         balance_asset = 0
         
         # ✅ NEW: Track accumulators
-        cumulative_grid_profit = 0 
+        cumulative_grid_profit = 0
         
         trade_history = []
         chart_data = []
