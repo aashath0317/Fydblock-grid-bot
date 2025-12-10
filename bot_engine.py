@@ -2,23 +2,24 @@ import asyncio
 import ccxt.async_support as ccxt  # Async version of CCXT
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
+from datetime import datetime
+import pandas as pd
+import numpy as np
 
 # --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("GridBot")
+logger = logging.getLogger("FydEngine")
 
 app = FastAPI(title="FydBlock Trading Engine")
 
 # Store active bot instances in memory
-# Format: { bot_id: { "task": asyncio.Task, "status": "running", "config": dict } }
 active_bots: Dict[int, dict] = {}
 
-# Exchange instances cache to avoid overhead
-exchange_cache = {}
-
 # --- DATA MODELS ---
+
+# For Live Trading
 class StrategyConfig(BaseModel):
     upper_price: float
     lower_price: float
@@ -28,29 +29,144 @@ class StrategyConfig(BaseModel):
 class BotRequest(BaseModel):
     bot_id: int
     user_id: int
-    exchange: str      # e.g., 'binance', 'bybit'
-    pair: str          # e.g., 'BTC/USDT'
+    exchange: str      
+    pair: str          
     api_key: str
     api_secret: str
     passphrase: Optional[str] = None
     strategy: StrategyConfig
 
-# --- GRID LOGIC CLASS ---
+# For Backtesting
+class BacktestConfig(BaseModel):
+    exchange: str = 'binance'
+    pair: str = 'BTC/USDT'
+    startDate: str  # YYYY-MM-DD
+    capital: float
+    upperPrice: float
+    lowerPrice: float
+    gridSize: int
+
+# --- 1. BACKTESTER CLASS (Simulation) ---
+class Backtester:
+    def __init__(self, config: BacktestConfig):
+        self.exchange_id = config.exchange.lower()
+        self.pair = config.pair
+        self.timeframe = '1h' 
+        self.start_date = config.startDate
+        self.initial_balance = config.capital
+        self.upper_price = config.upperPrice
+        self.lower_price = config.lowerPrice
+        self.grids = config.gridSize
+
+    async def fetch_historical_data(self):
+        # Initialize exchange (read-only, no keys needed)
+        exchange_class = getattr(ccxt, self.exchange_id)
+        exchange = exchange_class({'enableRateLimit': True})
+        
+        try:
+            # Convert start date to timestamp
+            since = exchange.parse8601(f"{self.start_date}T00:00:00Z")
+            
+            # Fetch OHLCV (Limit 1000 candles for demo speed)
+            ohlcv = await exchange.fetch_ohlcv(self.pair, self.timeframe, since, limit=1000)
+            return ohlcv
+        finally:
+            await exchange.close()
+
+    async def run(self):
+        logger.info(f"Running backtest for {self.pair}...")
+        ohlcv = await self.fetch_historical_data()
+        
+        if not ohlcv:
+            return {"status": "error", "message": "No historical data found"}
+
+        # Setup Grid Levels
+        step = (self.upper_price - self.lower_price) / self.grids
+        grid_levels = [self.lower_price + (i * step) for i in range(self.grids + 1)]
+        
+        # Simulation State
+        balance_usdt = self.initial_balance
+        balance_asset = 0
+        trade_history = []
+        chart_data = []
+        
+        # Track filled grids
+        active_grids = {i: False for i in range(len(grid_levels))}
+        investment_per_grid = self.initial_balance / self.grids
+
+        for candle in ohlcv:
+            timestamp, open_, high, low, close, volume = candle
+            date_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M')
+            action = None
+            
+            # Check Grid Logic
+            for i, level in enumerate(grid_levels):
+                # BUY: Price drops below level
+                if low < level and not active_grids[i]:
+                    if balance_usdt >= investment_per_grid:
+                        amount = investment_per_grid / level
+                        balance_usdt -= investment_per_grid
+                        balance_asset += amount
+                        active_grids[i] = True
+                        action = 'buy'
+                        trade_history.append({
+                            "time": date_str, "type": "Buy", 
+                            "price": level, "amount": amount, "profit": 0
+                        })
+
+                # SELL: Price rises above next level
+                elif high > (level + step) and active_grids[i]:
+                    if balance_asset > 0:
+                        amount = investment_per_grid / level 
+                        revenue = amount * (level + step)
+                        profit = revenue - investment_per_grid
+                        
+                        balance_usdt += revenue
+                        balance_asset -= amount
+                        active_grids[i] = False
+                        action = 'sell'
+                        trade_history.append({
+                            "time": date_str, "type": "Sell", 
+                            "price": level + step, "amount": amount, "profit": profit
+                        })
+
+            # Portfolio Value at this candle
+            current_value = balance_usdt + (balance_asset * close)
+            
+            chart_data.append({
+                "date": date_str,
+                "price": close,
+                "value": current_value,
+                "action": action
+            })
+
+        total_profit = current_value - self.initial_balance
+        roi = (total_profit / self.initial_balance) * 100
+        
+        return {
+            "status": "success",
+            "stats": {
+                "totalProfit": round(total_profit, 2),
+                "roi": round(roi, 2),
+                "totalTrades": len(trade_history)
+            },
+            "history": trade_history,
+            "chartData": chart_data 
+        }
+
+# --- 2. LIVE GRID BOT CLASS (Execution) ---
 class GridBot:
     def __init__(self, config: BotRequest):
         self.bot_id = config.bot_id
-        self.user_id = config.user_id
         self.pair = config.pair
         self.config = config
-        self.exchange_id = config.exchange.lower()
         self.exchange = None
         self.running = False
         self.grid_levels = []
-        self.last_grid_index = -1 # Tracks where we are in the grid
+        self.last_grid_index = -1 
 
     async def initialize_exchange(self):
-        """Initializes CCXT exchange instance with specific user keys."""
-        exchange_class = getattr(ccxt, self.exchange_id)
+        exchange_class = getattr(ccxt, self.config.exchange.lower())
         self.exchange = exchange_class({
             'apiKey': self.config.api_key,
             'secret': self.config.api_secret,
@@ -58,54 +174,42 @@ class GridBot:
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'} 
         })
-        # Load markets to ensure symbol exists and get precision info
         await self.exchange.load_markets()
 
     async def calculate_grids(self):
-        """Calculates price levels for the grid."""
         upper = self.config.strategy.upper_price
         lower = self.config.strategy.lower_price
         count = self.config.strategy.grids
-        
         step = (upper - lower) / count
         self.grid_levels = [lower + (i * step) for i in range(count + 1)]
-        logger.info(f"Bot {self.bot_id}: Calculated {len(self.grid_levels)} grid levels.")
 
     async def run(self):
-        """The Main Infinite Loop"""
         self.running = True
-        logger.info(f"🚀 Bot {self.bot_id} Started for {self.pair}")
+        logger.info(f"🚀 Live Bot {self.bot_id} Started")
 
         try:
             await self.initialize_exchange()
             await self.calculate_grids()
 
-            # Initial Price Check to find starting position
+            # Find starting position
             ticker = await self.exchange.fetch_ticker(self.pair)
             current_price = ticker['last']
-            
-            # Find closest grid level index
-            self.last_grid_index = min(
-                range(len(self.grid_levels)), 
-                key=lambda i: abs(self.grid_levels[i] - current_price)
-            )
+            self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - current_price))
 
             while self.running:
                 try:
-                    # 1. Fetch Real-Time Price
                     ticker = await self.exchange.fetch_ticker(self.pair)
                     price = ticker['last']
 
-                    # 2. Check Logic
-                    # Crossed UP -> SELL
+                    # SELL Logic
                     if self.last_grid_index < len(self.grid_levels) - 1:
                         next_level = self.grid_levels[self.last_grid_index + 1]
                         if price >= next_level:
                             await self.execute_trade('sell', price)
                             self.last_grid_index += 1
-                            continue # Skip sleep to catch rapid moves
+                            continue 
 
-                    # Crossed DOWN -> BUY
+                    # BUY Logic
                     if self.last_grid_index > 0:
                         prev_level = self.grid_levels[self.last_grid_index - 1]
                         if price <= prev_level:
@@ -113,12 +217,8 @@ class GridBot:
                             self.last_grid_index -= 1
                             continue
 
-                    # 3. Wait before next check (prevents rate limiting)
                     await asyncio.sleep(2) 
 
-                except ccxt.NetworkError as e:
-                    logger.warning(f"Bot {self.bot_id} Network Error: {e}")
-                    await asyncio.sleep(5)
                 except Exception as e:
                     logger.error(f"Bot {self.bot_id} Loop Error: {e}")
                     await asyncio.sleep(5)
@@ -128,23 +228,13 @@ class GridBot:
         finally:
             if self.exchange:
                 await self.exchange.close()
-            logger.info(f"🛑 Bot {self.bot_id} Stopped.")
 
     async def execute_trade(self, side, price):
-        """Executes a market order on the exchange."""
         try:
-            # Calculate amount based on investment per grid
-            # Simple logic: Investment / Grids / Price
             amount_usdt = self.config.strategy.investment / self.config.strategy.grids
             amount = amount_usdt / price 
-
-            # Place Order
-            order = await self.exchange.create_order(self.pair, 'market', side, amount)
-            logger.info(f"✅ Bot {self.bot_id}: {side.upper()} executed at ${price} (ID: {order['id']})")
-            
-            # Optional: Call back to Node.js to save trade history to DB
-            # await requests.post(NODE_CALLBACK_URL, json=...)
-
+            # order = await self.exchange.create_order(self.pair, 'market', side, amount)
+            logger.info(f"✅ Bot {self.bot_id}: {side.upper()} executed at ${price}")
         except Exception as e:
             logger.error(f"Bot {self.bot_id} Trade Failed: {e}")
 
@@ -154,16 +244,24 @@ class GridBot:
 def health_check():
     return {"status": "online", "active_bots": len(active_bots)}
 
+# 1. Backtest Endpoint
+@app.post("/backtest")
+async def run_backtest_endpoint(config: BacktestConfig):
+    try:
+        backtester = Backtester(config)
+        result = await backtester.run()
+        return result
+    except Exception as e:
+        logger.error(f"Backtest failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 2. Live Bot Start Endpoint
 @app.post("/start")
 async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTasks):
     if config.bot_id in active_bots:
         raise HTTPException(status_code=400, detail="Bot already running")
 
-    # Instantiate Bot
     bot = GridBot(config)
-    
-    # Run the bot.run() method as a background task
-    # We store the bot instance to control it later
     task = asyncio.create_task(bot.run())
     
     active_bots[config.bot_id] = {
@@ -171,20 +269,17 @@ async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTas
         "task": task,
         "config": config.dict()
     }
-
     return {"message": "Bot started successfully", "bot_id": config.bot_id}
 
+# 3. Live Bot Stop Endpoint
 @app.post("/stop/{bot_id}")
 async def stop_bot_endpoint(bot_id: int):
     if bot_id not in active_bots:
         raise HTTPException(status_code=404, detail="Bot not found")
 
-    # Signal the bot to stop looping
     bot_entry = active_bots[bot_id]
-    bot_instance = bot_entry["instance"]
-    bot_instance.running = False
+    bot_entry["instance"].running = False
     
-    # Wait for task to finish cleanup
     try:
         await bot_entry["task"]
     except asyncio.CancelledError:
@@ -192,9 +287,3 @@ async def stop_bot_endpoint(bot_id: int):
 
     del active_bots[bot_id]
     return {"message": "Bot stopped successfully"}
-
-@app.get("/status/{bot_id}")
-def get_bot_status(bot_id: int):
-    if bot_id in active_bots:
-        return {"status": "running", "details": active_bots[bot_id]["config"]}
-    return {"status": "stopped"}
