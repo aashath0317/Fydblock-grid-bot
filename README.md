@@ -149,10 +149,3 @@ await axios.post('http://localhost:8000/start', {
 ## 📄 License
 
 **MIT License**
-
----
-
-Let me know if you want:
-✅ Docker version  
-✅ Folder structure section  
-✅ Add WebSocket support for live bot logs  
