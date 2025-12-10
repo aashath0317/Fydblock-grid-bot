@@ -1,5 +1,5 @@
 import asyncio
-import ccxt.async_support as ccxt  # Async version of CCXT
+import ccxt.async_support as ccxt  
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Optional, List
@@ -8,18 +8,12 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-# --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FydEngine")
 
 app = FastAPI(title="FydBlock Trading Engine")
-
-# Store active bot instances in memory
 active_bots: Dict[int, dict] = {}
 
-# --- DATA MODELS ---
-
-# For Live Trading
 class StrategyConfig(BaseModel):
     upper_price: float
     lower_price: float
@@ -36,40 +30,57 @@ class BotRequest(BaseModel):
     passphrase: Optional[str] = None
     strategy: StrategyConfig
 
-# For Backtesting
 class BacktestConfig(BaseModel):
     exchange: str = 'binance'
     pair: str = 'BTC/USDT'
-    startDate: str  # YYYY-MM-DD
+    startDate: str  
+    endDate: str    # ✅ Added End Date
     capital: float
     upperPrice: float
     lowerPrice: float
     gridSize: int
 
-# --- 1. BACKTESTER CLASS (Simulation) ---
+# --- BACKTESTER ---
 class Backtester:
     def __init__(self, config: BacktestConfig):
+        self.config = config
         self.exchange_id = config.exchange.lower()
         self.pair = config.pair
         self.timeframe = '1h' 
         self.start_date = config.startDate
+        self.end_date = config.endDate # Use this
         self.initial_balance = config.capital
         self.upper_price = config.upperPrice
         self.lower_price = config.lowerPrice
         self.grids = config.gridSize
 
     async def fetch_historical_data(self):
-        # Initialize exchange (read-only, no keys needed)
         exchange_class = getattr(ccxt, self.exchange_id)
         exchange = exchange_class({'enableRateLimit': True})
         
         try:
-            # Convert start date to timestamp
-            since = exchange.parse8601(f"{self.start_date}T00:00:00Z")
+            start_ts = exchange.parse8601(f"{self.start_date}T00:00:00Z")
+            end_ts = exchange.parse8601(f"{self.end_date}T23:59:59Z") # End of Day
+
+            all_ohlcv = []
+            current_since = start_ts
             
-            # Fetch OHLCV (Limit 1000 candles for demo speed)
-            ohlcv = await exchange.fetch_ohlcv(self.pair, self.timeframe, since, limit=1000)
-            return ohlcv
+            # Fetch loop (Pagination)
+            while current_since < end_ts:
+                ohlcv = await exchange.fetch_ohlcv(self.pair, self.timeframe, current_since, limit=1000)
+                if not ohlcv: break
+                
+                # Filter results
+                batch = [c for c in ohlcv if c[0] <= end_ts]
+                all_ohlcv += batch
+                
+                last_time = ohlcv[-1][0]
+                if last_time == current_since: break # Avoid infinite loop
+                current_since = last_time + 1
+                
+                if last_time >= end_ts: break
+
+            return all_ohlcv
         finally:
             await exchange.close()
 
@@ -80,17 +91,14 @@ class Backtester:
         if not ohlcv:
             return {"status": "error", "message": "No historical data found"}
 
-        # Setup Grid Levels
         step = (self.upper_price - self.lower_price) / self.grids
         grid_levels = [self.lower_price + (i * step) for i in range(self.grids + 1)]
         
-        # Simulation State
         balance_usdt = self.initial_balance
         balance_asset = 0
         trade_history = []
         chart_data = []
         
-        # Track filled grids
         active_grids = {i: False for i in range(len(grid_levels))}
         investment_per_grid = self.initial_balance / self.grids
 
@@ -99,9 +107,7 @@ class Backtester:
             date_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M')
             action = None
             
-            # Check Grid Logic
             for i, level in enumerate(grid_levels):
-                # BUY: Price drops below level
                 if low < level and not active_grids[i]:
                     if balance_usdt >= investment_per_grid:
                         amount = investment_per_grid / level
@@ -110,34 +116,25 @@ class Backtester:
                         active_grids[i] = True
                         action = 'buy'
                         trade_history.append({
-                            "time": date_str, "type": "Buy", 
-                            "price": level, "amount": amount, "profit": 0
+                            "time": date_str, "type": "Buy", "price": level, "amount": amount, "profit": 0
                         })
 
-                # SELL: Price rises above next level
                 elif high > (level + step) and active_grids[i]:
                     if balance_asset > 0:
                         amount = investment_per_grid / level 
                         revenue = amount * (level + step)
                         profit = revenue - investment_per_grid
-                        
                         balance_usdt += revenue
                         balance_asset -= amount
                         active_grids[i] = False
                         action = 'sell'
                         trade_history.append({
-                            "time": date_str, "type": "Sell", 
-                            "price": level + step, "amount": amount, "profit": profit
+                            "time": date_str, "type": "Sell", "price": level + step, "amount": amount, "profit": profit
                         })
 
-            # Portfolio Value at this candle
             current_value = balance_usdt + (balance_asset * close)
-            
             chart_data.append({
-                "date": date_str,
-                "price": close,
-                "value": current_value,
-                "action": action
+                "date": date_str, "price": close, "value": current_value, "action": action
             })
 
         total_profit = current_value - self.initial_balance
@@ -154,7 +151,7 @@ class Backtester:
             "chartData": chart_data 
         }
 
-# --- 2. LIVE GRID BOT CLASS (Execution) ---
+# --- LIVE BOT ---
 class GridBot:
     def __init__(self, config: BotRequest):
         self.bot_id = config.bot_id
@@ -186,12 +183,9 @@ class GridBot:
     async def run(self):
         self.running = True
         logger.info(f"🚀 Live Bot {self.bot_id} Started")
-
         try:
             await self.initialize_exchange()
             await self.calculate_grids()
-
-            # Find starting position
             ticker = await self.exchange.fetch_ticker(self.pair)
             current_price = ticker['last']
             self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - current_price))
@@ -200,90 +194,61 @@ class GridBot:
                 try:
                     ticker = await self.exchange.fetch_ticker(self.pair)
                     price = ticker['last']
-
-                    # SELL Logic
                     if self.last_grid_index < len(self.grid_levels) - 1:
                         next_level = self.grid_levels[self.last_grid_index + 1]
                         if price >= next_level:
                             await self.execute_trade('sell', price)
                             self.last_grid_index += 1
                             continue 
-
-                    # BUY Logic
                     if self.last_grid_index > 0:
                         prev_level = self.grid_levels[self.last_grid_index - 1]
                         if price <= prev_level:
                             await self.execute_trade('buy', price)
                             self.last_grid_index -= 1
                             continue
-
                     await asyncio.sleep(2) 
-
                 except Exception as e:
                     logger.error(f"Bot {self.bot_id} Loop Error: {e}")
                     await asyncio.sleep(5)
-
         except Exception as e:
             logger.error(f"Bot {self.bot_id} Critical Failure: {e}")
         finally:
-            if self.exchange:
-                await self.exchange.close()
+            if self.exchange: await self.exchange.close()
 
     async def execute_trade(self, side, price):
         try:
             amount_usdt = self.config.strategy.investment / self.config.strategy.grids
             amount = amount_usdt / price 
-            # order = await self.exchange.create_order(self.pair, 'market', side, amount)
             logger.info(f"✅ Bot {self.bot_id}: {side.upper()} executed at ${price}")
         except Exception as e:
             logger.error(f"Bot {self.bot_id} Trade Failed: {e}")
 
-# --- API ENDPOINTS ---
-
 @app.get("/")
-def health_check():
-    return {"status": "online", "active_bots": len(active_bots)}
+def health_check(): return {"status": "online", "active_bots": len(active_bots)}
 
-# 1. Backtest Endpoint
 @app.post("/backtest")
 async def run_backtest_endpoint(config: BacktestConfig):
     try:
         backtester = Backtester(config)
-        result = await backtester.run()
-        return result
+        return await backtester.run()
     except Exception as e:
         logger.error(f"Backtest failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 2. Live Bot Start Endpoint
 @app.post("/start")
 async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTasks):
-    if config.bot_id in active_bots:
-        raise HTTPException(status_code=400, detail="Bot already running")
-
+    if config.bot_id in active_bots: raise HTTPException(status_code=400, detail="Bot already running")
     bot = GridBot(config)
     task = asyncio.create_task(bot.run())
-    
-    active_bots[config.bot_id] = {
-        "instance": bot,
-        "task": task,
-        "config": config.dict()
-    }
+    active_bots[config.bot_id] = { "instance": bot, "task": task, "config": config.dict() }
     return {"message": "Bot started successfully", "bot_id": config.bot_id}
 
-# 3. Live Bot Stop Endpoint
 @app.post("/stop/{bot_id}")
 async def stop_bot_endpoint(bot_id: int):
-    if bot_id not in active_bots:
-        raise HTTPException(status_code=404, detail="Bot not found")
-
+    if bot_id not in active_bots: raise HTTPException(status_code=404, detail="Bot not found")
     bot_entry = active_bots[bot_id]
     bot_entry["instance"].running = False
-    
-    try:
-        await bot_entry["task"]
-    except asyncio.CancelledError:
-        pass
-
+    try: await bot_entry["task"]
+    except asyncio.CancelledError: pass
     del active_bots[bot_id]
     return {"message": "Bot stopped successfully"}
