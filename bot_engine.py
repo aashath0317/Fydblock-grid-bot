@@ -49,9 +49,6 @@ class BacktestConfig(BaseModel):
     trailingDown: Optional[bool] = False
     gridSize: int
 
-# ==========================================
-# 1. BACKTEST ENGINE (No-Sell-On-Dump Version)
-# ==========================================
 class Backtester:
     def __init__(self, config: BacktestConfig):
         self.config = config
@@ -62,7 +59,6 @@ class Backtester:
         self.end_date = config.endDate 
         self.initial_balance = config.capital
         
-        # --- FAILSAFE ---
         if config.riskPercentage == 0 and config.upperPrice == 0 and config.lowerPrice == 0:
             logger.warning("⚠️ FAILSAFE: Config 0s. Forcing AUTO (10% Risk).")
             self.risk_pct = 0.10
@@ -148,13 +144,11 @@ class Backtester:
             
             # --- STRATEGY LOGIC ---
             if self.risk_pct and self.risk_pct > 0:
-                # 1. UPPER BREAKOUT -> Chase Up (Reset Both)
                 if high >= self.curr_upper:
                     self.curr_upper = high * (1 + self.risk_pct)
                     self.curr_lower = high * (1 - self.risk_pct)
                     reset_needed = True
                     action = 'reset_up'
-                # 2. LOWER BREAKOUT -> Expand Only (Lower Bottom, Keep Top)
                 elif low <= self.curr_lower:
                     self.curr_lower = low * (1 - self.risk_pct)
                     reset_needed = True
@@ -169,17 +163,13 @@ class Backtester:
                     self.curr_lower += grid_shift
                     grid_levels = [level + grid_shift for level in grid_levels]
 
-            # APPLY RESET / EXPANSION
             if reset_needed:
                 grid_levels, step = self.calculate_grid_levels()
-                
-                # --- REBALANCE LOGIC (SAFE) ---
                 total_equity = balance_usdt + (balance_asset * close)
                 target_asset_val = total_equity * 0.5
                 current_asset_val = balance_asset * close
                 
                 if current_asset_val < target_asset_val:
-                    # Need to Buy: Only if we have USDT
                     diff_usdt = target_asset_val - current_asset_val
                     amount = diff_usdt / close
                     if balance_usdt >= diff_usdt:
@@ -187,13 +177,9 @@ class Backtester:
                         balance_asset += amount
                         
                 elif current_asset_val > target_asset_val:
-                    # Need to Sell: ONLY if moving UP. Don't sell on a dump.
                     if action == 'expand_down':
-                        # PROTECT ASSETS: Do NOT sell when expanding down.
-                        # We accept being "Heavy" on assets to avoid realizing loss.
                         pass 
                     else:
-                        # Selling into strength (Up move) is fine
                         diff_asset_val = current_asset_val - target_asset_val
                         amount = diff_asset_val / close
                         balance_asset -= amount
@@ -250,9 +236,6 @@ class Backtester:
             "chartData": chart_data 
         }
 
-# ==========================================
-# 2. LIVE TRADING BOT (Async Execution)
-# ==========================================
 class GridBot:
     def __init__(self, config: BotRequest):
         self.bot_id = config.bot_id
@@ -314,14 +297,10 @@ class GridBot:
                             reset_needed = True
                         elif price <= self.config.strategy.lower_price:
                             logger.info(f"Bot {self.bot_id}: Price hit LOWER. Expanding grid...")
-                            # LIVE BOT: Only lower the bottom limit
                             self.config.strategy.lower_price = price * (1 - risk)
                             reset_needed = True
                             
                         if reset_needed:
-                            # IMPORTANT: Live bot logic for avoiding sell on dump
-                            # You would need to check existing balances here in a real live bot
-                            # For now, we recalculate grids.
                             await self.calculate_grids() 
                             self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - price))
                             continue 
@@ -370,9 +349,7 @@ class GridBot:
             logger.info(f"✅ Bot {self.bot_id}: {side.upper()} order {order['id']} placed at {formatted_price}")
         except Exception as e: logger.error(f"❌ Bot {self.bot_id} Trade Failed: {e}")
 
-# ==========================================
-# 3. API ENDPOINTS
-# ==========================================
+# API ENDPOINTS
 @app.get("/")
 def health_check(): return {"status": "online", "active_bots": len(active_bots)}
 
