@@ -8,20 +8,20 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-# Configure Logging
+# --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FydEngine")
 
 app = FastAPI(title="FydBlock Trading Engine")
 active_bots: Dict[int, dict] = {}
 
-# --- MODELS ---
+# --- DATA MODELS ---
 class StrategyConfig(BaseModel):
     upper_price: Optional[float] = 0
     lower_price: Optional[float] = 0
     risk_percentage: Optional[float] = 0  # 0.1 (High), 0.2 (Med), 0.3 (Low)
-    trailing_up: Optional[bool] = False   # For Manual
-    trailing_down: Optional[bool] = False # For Manual
+    trailing_up: Optional[bool] = False   # For Manual Mode
+    trailing_down: Optional[bool] = False # For Manual Mode
     grids: int
     investment: float
 
@@ -49,7 +49,9 @@ class BacktestConfig(BaseModel):
     trailingDown: Optional[bool] = False
     gridSize: int
 
-# --- BACKTESTER ---
+# ==========================================
+# 1. BACKTEST ENGINE (With Auto-Rebalance)
+# ==========================================
 class Backtester:
     def __init__(self, config: BacktestConfig):
         self.config = config
@@ -60,22 +62,20 @@ class Backtester:
         self.end_date = config.endDate 
         self.initial_balance = config.capital
         
-        # Current active settings
+        # Current Active Settings
         self.curr_upper = config.upperPrice
         self.curr_lower = config.lowerPrice
         self.risk_pct = config.riskPercentage
         self.grids = config.gridSize
-        
         self.trailing_up = config.trailingUp
         self.trailing_down = config.trailingDown
 
     async def fetch_historical_data(self):
-        # Initialize exchange in sandbox/test mode just for data fetching
+        # Initialize exchange for data fetching only
         exchange_class = getattr(ccxt, self.exchange_id)
         exchange = exchange_class({'enableRateLimit': True})
         
         try:
-            # Convert ISO dates to timestamps
             start_ts = exchange.parse8601(f"{self.start_date}T00:00:00Z")
             end_ts = exchange.parse8601(f"{self.end_date}T23:59:59Z")
             
@@ -96,7 +96,6 @@ class Backtester:
                     
                     if last_time >= end_ts: break
                     await asyncio.sleep(exchange.rateLimit / 1000)
-                    
                 except Exception as e:
                     logger.error(f"Error fetching candles: {e}")
                     break
@@ -106,6 +105,7 @@ class Backtester:
             await exchange.close()
 
     def calculate_grid_levels(self):
+        # Standard Grid Calculation
         step = (self.curr_upper - self.curr_lower) / self.grids
         return [self.curr_lower + (i * step) for i in range(self.grids + 1)], step
 
@@ -116,8 +116,10 @@ class Backtester:
         if not ohlcv:
             return {"status": "error", "message": "No historical data found"}
 
-        # --- 1. INITIAL AUTO RANGE ---
+        # --- INITIAL SETUP ---
         first_close = ohlcv[0][4]
+        
+        # Set initial range if Auto Mode
         if self.risk_pct and self.risk_pct > 0:
             self.curr_upper = first_close * (1 + self.risk_pct)
             self.curr_lower = first_close * (1 - self.risk_pct)
@@ -133,38 +135,61 @@ class Backtester:
         trade_history = []
         chart_data = []
         
-        active_grids = {i: False for i in range(len(grid_levels))}
-        investment_per_grid = self.initial_balance / self.grids
+        # Initial Buy-In (50% Asset / 50% Cash)
+        # This is crucial: we assume we start neutrally
+        initial_buy = (self.initial_balance * 0.5) / first_close
+        balance_asset += initial_buy
+        balance_usdt -= (self.initial_balance * 0.5)
         
+        # Active Grids: 
+        # Price is in the middle. 
+        # Levels > Price are "Filled" (we have asset to sell). 
+        # Levels < Price are "Empty" (we have cash to buy).
+        active_grids = {
+            i: (level < first_close) # False = Waiting to Buy (Low), True = Waiting to Sell (High)
+            for i, level in enumerate(grid_levels)
+        }
+        
+        # Invert logic for grid standard:
+        # If level < current price, we should have ALREADY BOUGHT. So we hold asset. Next move is SELL. (active=True)
+        # If level > current price, we have NOT BOUGHT. We hold cash. Next move is BUY. (active=False)
+        active_grids = {}
+        for i, level in enumerate(grid_levels):
+            if level < first_close:
+                active_grids[i] = True  # We hold this bag, ready to sell
+            else:
+                active_grids[i] = False # We don't hold, ready to buy
+
+        investment_per_grid = self.initial_balance / self.grids
         skip_step = max(1, len(ohlcv) // 500) 
 
+        # --- SIMULATION LOOP ---
         for index, candle in enumerate(ohlcv):
             timestamp, open_, high, low, close, volume = candle
             date_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M')
             action = None
             
-            # --- 2. AUTO-RESET LOGIC (Dynamic Grids) ---
-            # If Auto Mode (Risk % > 0) is enabled, check boundaries
+            # ---------------------------
+            # 1. AUTO-RESET & TRAILING
+            # ---------------------------
             reset_needed = False
             
+            # AUTO MODE: Re-Center Grid on Breakout
             if self.risk_pct and self.risk_pct > 0:
-                # HIT UPPER BOUND -> RESET UP
                 if close > self.curr_upper:
-                    # Reset center to current price
+                    # RESET UP
                     self.curr_upper = close * (1 + self.risk_pct)
                     self.curr_lower = close * (1 - self.risk_pct)
                     reset_needed = True
                     action = 'reset_up'
-                
-                # HIT LOWER BOUND -> RESET DOWN
-                # Note: User suggested expanding, but re-centering is safer for automation
                 elif close < self.curr_lower:
+                    # RESET DOWN
                     self.curr_upper = close * (1 + self.risk_pct)
                     self.curr_lower = close * (1 - self.risk_pct)
                     reset_needed = True
                     action = 'reset_down'
 
-            # Manual Trailing Logic (if not Auto)
+            # MANUAL MODE: Simple Trailing (No Rebalance)
             elif not reset_needed:
                 grid_shift = 0
                 if self.trailing_up and close > self.curr_upper:
@@ -175,22 +200,55 @@ class Backtester:
                 if grid_shift != 0:
                     self.curr_upper += grid_shift
                     self.curr_lower += grid_shift
+                    # Just shift lines, don't rebalance
                     grid_levels = [level + grid_shift for level in grid_levels]
 
-            # PERFORM RESET IF NEEDED
+            # APPLY RESET WITH REBALANCE
             if reset_needed:
-                # Recalculate grids based on new range
+                # 1. New Grids
                 grid_levels, step = self.calculate_grid_levels()
-                # Clear active grids (simulating cancelling orders)
-                active_grids = {i: False for i in range(len(grid_levels))}
                 
-                # Re-balancing logic: In a real scenario, you might sell/buy to fit new range.
-                # For simulation simplified: We keep balances but reset grid tracking.
-                investment_per_grid = (balance_usdt + (balance_asset * close)) / self.grids
+                # 2. Total Equity Value
+                total_equity = balance_usdt + (balance_asset * close)
+                
+                # 3. Rebalance to 50/50 Neutral Strategy
+                # This ensures we always have ammo to follow the trend up or down
+                target_asset_val = total_equity * 0.5
+                current_asset_val = balance_asset * close
+                
+                if current_asset_val < target_asset_val:
+                    # BUY MORE
+                    diff_usdt = target_asset_val - current_asset_val
+                    amount = diff_usdt / close
+                    if balance_usdt >= diff_usdt:
+                        balance_usdt -= diff_usdt
+                        balance_asset += amount
+                
+                elif current_asset_val > target_asset_val:
+                    # SELL EXCESS
+                    diff_asset_val = current_asset_val - target_asset_val
+                    amount = diff_asset_val / close
+                    balance_asset -= amount
+                    balance_usdt += (amount * close)
 
-            # --- 3. TRADE EXECUTION ---
+                # 4. Reset Grid States
+                # Levels below price = Filled (Ready to Sell)
+                # Levels above price = Empty (Ready to Buy)
+                active_grids = {}
+                for i, level in enumerate(grid_levels):
+                    if level < close:
+                        active_grids[i] = True 
+                    else:
+                        active_grids[i] = False
+                
+                # Update unit size
+                investment_per_grid = total_equity / self.grids
+
+            # ---------------------------
+            # 2. GRID TRADING EXECUTION
+            # ---------------------------
             for i, level in enumerate(grid_levels):
-                # BUY
+                # BUY: Price hits lower line AND we don't have a bag yet
                 if low < level and not active_grids[i]:
                     if balance_usdt >= investment_per_grid:
                         amount = investment_per_grid / level
@@ -202,21 +260,26 @@ class Backtester:
                             "time": date_str, "type": "Buy", "price": level, "amount": amount, "profit": 0
                         })
 
-                # SELL
+                # SELL: Price hits upper line AND we hold a bag
                 elif high > (level + step) and active_grids[i]:
                     if balance_asset > 0:
-                        amount = investment_per_grid / level 
-                        revenue = amount * (level + step)
-                        profit = revenue - investment_per_grid
+                        amount = investment_per_grid / level # Sell 1 grid unit
+                        # Safety check if we have enough asset (floating point errors)
+                        sell_amt = min(amount, balance_asset)
+                        
+                        revenue = sell_amt * (level + step)
+                        profit = revenue - (sell_amt * level) # Gross profit per grid
+                        
                         balance_usdt += revenue
-                        balance_asset -= amount
+                        balance_asset -= sell_amt
                         cumulative_grid_profit += profit
                         active_grids[i] = False
                         if not action: action = 'sell'
                         trade_history.append({
-                            "time": date_str, "type": "Sell", "price": level + step, "amount": amount, "profit": profit
+                            "time": date_str, "type": "Sell", "price": level + step, "amount": sell_amt, "profit": profit
                         })
 
+            # Record Data for Chart
             if index % skip_step == 0 or action:
                 current_asset_value = balance_asset * close
                 total_equity = balance_usdt + current_asset_value
@@ -229,7 +292,7 @@ class Backtester:
                     "action": action
                 })
 
-        # Final Stats
+        # --- FINAL RESULTS ---
         final_price = ohlcv[-1][4]
         current_asset_value = balance_asset * final_price
         total_equity = balance_usdt + current_asset_value
@@ -248,7 +311,9 @@ class Backtester:
             "chartData": chart_data 
         }
 
-# --- LIVE BOT ---
+# ==========================================
+# 2. LIVE TRADING BOT (Async Execution)
+# ==========================================
 class GridBot:
     def __init__(self, config: BotRequest):
         self.bot_id = config.bot_id
@@ -269,12 +334,16 @@ class GridBot:
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'} 
         })
+        
+        # Load markets for precision formatting
         markets = await self.exchange.load_markets()
         if self.pair in markets:
             self.market_precision = markets[self.pair]
+        else:
+            logger.error(f"Pair {self.pair} not found on {self.config.exchange}")
 
     async def calculate_grids(self):
-        # Auto Range Calculation
+        # Handle Auto Calculation
         risk = self.config.strategy.risk_percentage
         if risk and risk > 0:
             ticker = await self.exchange.fetch_ticker(self.pair)
@@ -297,13 +366,14 @@ class GridBot:
 
     async def run(self):
         self.running = True
-        logger.info(f"🚀 Live Bot {self.bot_id} Started")
+        logger.info(f"🚀 Live Bot {self.bot_id} Started on {self.config.exchange}")
+        
         try:
             await self.initialize_exchange()
             await self.calculate_grids()
             
             ticker = await self.exchange.fetch_ticker(self.pair)
-            # Find start index
+            # Find nearest grid to start
             self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - ticker['last']))
 
             while self.running:
@@ -311,10 +381,11 @@ class GridBot:
                     ticker = await self.exchange.fetch_ticker(self.pair)
                     price = ticker['last']
                     
-                    # --- AUTO RESET LOGIC (Live) ---
+                    # --- AUTO RESET / TRAILING LOGIC ---
                     risk = self.config.strategy.risk_percentage
                     reset_needed = False
                     
+                    # Auto Mode Logic
                     if risk and risk > 0:
                         if price > self.config.strategy.upper_price:
                             logger.info(f"Bot {self.bot_id}: Price broke UPPER. Resetting grid...")
@@ -328,14 +399,23 @@ class GridBot:
                             reset_needed = True
                             
                         if reset_needed:
-                            # Cancel all open orders first (logic placeholder)
-                            # await self.exchange.cancel_all_orders(self.pair)
-                            await self.calculate_grids() # Recalculate based on new bounds
+                            # In real bot: await self.exchange.cancel_all_orders(self.pair)
+                            await self.calculate_grids() 
                             self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - price))
-                            # Continue to next loop iteration immediately
-                            continue
+                            continue # Restart loop with new grids
 
-                    # --- TRADING LOGIC ---
+                    # Manual Trailing Logic
+                    elif self.config.strategy.trailing_up and price > self.grid_levels[-1]:
+                        shift = price - self.grid_levels[-1]
+                        self.grid_levels = [l + shift for l in self.grid_levels]
+                    
+                    elif self.config.strategy.trailing_down and price < self.grid_levels[0]:
+                        shift = price - self.grid_levels[0]
+                        self.grid_levels = [l + shift for l in self.grid_levels]
+
+                    # --- GRID EXECUTION LOGIC ---
+                    
+                    # 1. Price UP -> Sell
                     if self.last_grid_index < len(self.grid_levels) - 1:
                         next_level = self.grid_levels[self.last_grid_index + 1]
                         if price >= next_level:
@@ -343,6 +423,7 @@ class GridBot:
                             self.last_grid_index += 1
                             continue 
 
+                    # 2. Price DOWN -> Buy
                     if self.last_grid_index > 0:
                         prev_level = self.grid_levels[self.last_grid_index - 1]
                         if price <= prev_level:
@@ -350,10 +431,12 @@ class GridBot:
                             self.last_grid_index -= 1
                             continue
                             
-                    await asyncio.sleep(5) 
+                    await asyncio.sleep(5) # Poll every 5s
+                    
                 except Exception as e:
                     logger.error(f"Bot {self.bot_id} Loop Error: {e}")
                     await asyncio.sleep(5)
+                    
         except Exception as e:
             logger.error(f"Bot {self.bot_id} Critical Failure: {e}")
         finally:
@@ -361,10 +444,11 @@ class GridBot:
 
     async def execute_trade(self, side, price):
         try:
-            # Calculate simple amount
-            inv_per_grid = self.config.strategy.investment / self.config.strategy.grids
-            amount = inv_per_grid / price
+            # 1. Calculate Amount
+            investment_per_grid = self.config.strategy.investment / self.config.strategy.grids
+            amount = investment_per_grid / price
 
+            # 2. Precision Formatting (Crucial for live execution)
             if self.market_precision:
                 symbol = self.pair
                 formatted_amount = self.exchange.amount_to_precision(symbol, amount)
@@ -373,10 +457,10 @@ class GridBot:
                 formatted_amount = amount
                 formatted_price = price
 
-            # LIVE TRADE
+            # 3. Execute Order
             order = await self.exchange.create_order(
                 symbol=self.pair,
-                type='limit', 
+                type='limit', # Or 'market'
                 side=side,
                 amount=formatted_amount,
                 price=formatted_price
@@ -385,10 +469,15 @@ class GridBot:
             logger.info(f"✅ Bot {self.bot_id}: {side.upper()} order {order['id']} placed at {formatted_price}")
 
         except Exception as e:
-            logger.error(f"❌ Bot {self.bot_id} Trade Execution Failed: {e}")
+            logger.error(f"❌ Bot {self.bot_id} Trade Failed: {e}")
+
+# ==========================================
+# 3. API ENDPOINTS
+# ==========================================
 
 @app.get("/")
-def health_check(): return {"status": "online", "active_bots": len(active_bots)}
+def health_check(): 
+    return {"status": "online", "active_bots": len(active_bots)}
 
 @app.post("/backtest")
 async def run_backtest_endpoint(config: BacktestConfig):
@@ -401,7 +490,8 @@ async def run_backtest_endpoint(config: BacktestConfig):
 
 @app.post("/start")
 async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTasks):
-    if config.bot_id in active_bots: raise HTTPException(status_code=400, detail="Bot already running")
+    if config.bot_id in active_bots: 
+        raise HTTPException(status_code=400, detail="Bot already running")
     
     bot = GridBot(config)
     task = asyncio.create_task(bot.run())
@@ -411,10 +501,16 @@ async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTas
 
 @app.post("/stop/{bot_id}")
 async def stop_bot_endpoint(bot_id: int):
-    if bot_id not in active_bots: raise HTTPException(status_code=404, detail="Bot not found")
+    if bot_id not in active_bots: 
+        raise HTTPException(status_code=404, detail="Bot not found")
+    
     bot_entry = active_bots[bot_id]
     bot_entry["instance"].running = False
-    try: await asyncio.wait_for(bot_entry["task"], timeout=5.0)
-    except: pass
+    
+    try: 
+        await asyncio.wait_for(bot_entry["task"], timeout=5.0)
+    except: 
+        pass
+        
     del active_bots[bot_id]
     return {"message": "Bot stopped successfully"}
