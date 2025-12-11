@@ -16,8 +16,11 @@ active_bots: Dict[int, dict] = {}
 
 # --- MODELS ---
 class StrategyConfig(BaseModel):
-    upper_price: Optional[float] = 0  # ✅ Changed to Optional/Default 0
+    upper_price: Optional[float] = 0
     lower_price: Optional[float] = 0
+    risk_percentage: Optional[float] = 0  # 0.1, 0.2, 0.3 (for Auto)
+    trailing_up: Optional[bool] = False   # For Manual
+    trailing_down: Optional[bool] = False # For Manual
     grids: int
     investment: float
 
@@ -38,8 +41,11 @@ class BacktestConfig(BaseModel):
     startDate: str  
     endDate: str    
     capital: float
-    upperPrice: Optional[float] = 0 # ✅ Default 0 for Auto-Calculation
+    upperPrice: Optional[float] = 0 
     lowerPrice: Optional[float] = 0
+    riskPercentage: Optional[float] = 0 # 0.1 = High, 0.2 = Med, 0.3 = Low
+    trailingUp: Optional[bool] = False
+    trailingDown: Optional[bool] = False
     gridSize: int
 
 # --- BACKTESTER ---
@@ -54,32 +60,28 @@ class Backtester:
         self.initial_balance = config.capital
         self.upper_price = config.upperPrice
         self.lower_price = config.lowerPrice
+        self.risk_pct = config.riskPercentage
         self.grids = config.gridSize
+        self.trailing_up = config.trailingUp
+        self.trailing_down = config.trailingDown
 
     async def fetch_historical_data(self):
         exchange_class = getattr(ccxt, self.exchange_id)
         exchange = exchange_class({'enableRateLimit': True})
-        
         try:
             start_ts = exchange.parse8601(f"{self.start_date}T00:00:00Z")
             end_ts = exchange.parse8601(f"{self.end_date}T23:59:59Z")
-
             all_ohlcv = []
             current_since = start_ts
-            
             while current_since < end_ts:
                 ohlcv = await exchange.fetch_ohlcv(self.pair, self.timeframe, current_since, limit=1000)
                 if not ohlcv: break
-                
                 batch = [c for c in ohlcv if c[0] <= end_ts]
                 all_ohlcv += batch
-                
                 last_time = ohlcv[-1][0]
                 if last_time == current_since: break 
                 current_since = last_time + 1 
-                
                 if last_time >= end_ts: break
-
             return all_ohlcv
         finally:
             await exchange.close()
@@ -91,29 +93,29 @@ class Backtester:
         if not ohlcv:
             return {"status": "error", "message": "No historical data found"}
 
-        # ✅ AUTO-CALCULATION FOR BACKTEST
-        # If user didn't provide prices (sent 0), calculate based on FIRST CANDLE
-        first_close = ohlcv[0][4] # [timestamp, open, high, low, close, vol]
-        
-        if self.upper_price == 0 or self.lower_price == 0:
-            logger.info(f"Auto-calculating range based on start price: ${first_close}")
-            self.upper_price = first_close * 1.10 # +10%
-            self.lower_price = first_close * 0.90 # -10%
+        # --- 1. AUTO RANGE CALCULATION (If Auto Mode) ---
+        first_close = ohlcv[0][4]
+        if self.risk_pct > 0:
+            logger.info(f"Auto-calculating range based on risk {self.risk_pct*100}% at start price: ${first_close}")
+            self.upper_price = first_close * (1 + self.risk_pct)
+            self.lower_price = first_close * (1 - self.risk_pct)
+        elif self.upper_price == 0 or self.lower_price == 0:
+            # Fallback if no risk pct and no price provided
+            self.upper_price = first_close * 1.10
+            self.lower_price = first_close * 0.90
 
+        # Initial Grid Setup
         step = (self.upper_price - self.lower_price) / self.grids
         grid_levels = [self.lower_price + (i * step) for i in range(self.grids + 1)]
         
         balance_usdt = self.initial_balance
         balance_asset = 0
         cumulative_grid_profit = 0
-        
         trade_history = []
         chart_data = []
         
         active_grids = {i: False for i in range(len(grid_levels))}
         investment_per_grid = self.initial_balance / self.grids
-
-        # Downsampling for performance if data is huge
         skip_step = max(1, len(ohlcv) // 1000) 
 
         for index, candle in enumerate(ohlcv):
@@ -121,6 +123,26 @@ class Backtester:
             date_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M')
             action = None
             
+            # --- 2. TRAILING LOGIC (Shift Grids) ---
+            grid_shift = 0
+            if self.trailing_up and close > self.upper_price:
+                # Move everything UP by one step size roughly
+                diff = close - self.upper_price
+                grid_shift = diff
+            elif self.trailing_down and close < self.lower_price:
+                # Move everything DOWN
+                diff = close - self.lower_price
+                grid_shift = diff
+            
+            if grid_shift != 0:
+                self.upper_price += grid_shift
+                self.lower_price += grid_shift
+                # Re-calculate levels
+                grid_levels = [level + grid_shift for level in grid_levels]
+                # Note: In a real bot, we'd cancel orders and replace them. 
+                # Here we just shift the logic reference.
+
+            # --- 3. TRADE LOGIC ---
             for i, level in enumerate(grid_levels):
                 # BUY
                 if low < level and not active_grids[i]:
@@ -149,11 +171,9 @@ class Backtester:
                             "time": date_str, "type": "Sell", "price": level + step, "amount": amount, "profit": profit
                         })
 
-            # Record Data
             if index % skip_step == 0 or action:
                 current_asset_value = balance_asset * close
                 total_equity = balance_usdt + current_asset_value
-                
                 chart_data.append({
                     "date": date_str, 
                     "price": close, 
@@ -163,7 +183,6 @@ class Backtester:
                     "action": action
                 })
 
-        # Final Stats
         final_price = ohlcv[-1][4]
         current_asset_value = balance_asset * final_price
         total_equity = balance_usdt + current_asset_value
@@ -205,12 +224,19 @@ class GridBot:
         await self.exchange.load_markets()
 
     async def calculate_grids(self):
-        # ✅ AUTO-CALCULATION FOR LIVE BOT
-        # If prices are 0, fetch current market price and set range
-        if self.config.strategy.upper_price == 0 or self.config.strategy.lower_price == 0:
+        # Handle Auto Calculation if Risk Percentage is provided
+        risk = self.config.strategy.risk_percentage
+        if risk and risk > 0:
             ticker = await self.exchange.fetch_ticker(self.pair)
             current_price = ticker['last']
-            logger.info(f"Bot {self.bot_id}: Auto-setting range based on current price: ${current_price}")
+            logger.info(f"Bot {self.bot_id}: Auto-setting {risk*100}% range. Price: ${current_price}")
+            self.config.strategy.upper_price = current_price * (1 + risk)
+            self.config.strategy.lower_price = current_price * (1 - risk)
+        
+        elif self.config.strategy.upper_price == 0:
+             # Default fallback
+            ticker = await self.exchange.fetch_ticker(self.pair)
+            current_price = ticker['last']
             self.config.strategy.upper_price = current_price * 1.10
             self.config.strategy.lower_price = current_price * 0.90
 
@@ -220,7 +246,6 @@ class GridBot:
         
         step = (upper - lower) / count
         self.grid_levels = [lower + (i * step) for i in range(count + 1)]
-        logger.info(f"Bot {self.bot_id} Grids set: {lower} to {upper} (Step: {step})")
 
     async def run(self):
         self.running = True
@@ -230,17 +255,27 @@ class GridBot:
             await self.calculate_grids()
             
             ticker = await self.exchange.fetch_ticker(self.pair)
-            current_price = ticker['last']
-            
-            # Find closest grid level to start
-            self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - current_price))
+            self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - ticker['last']))
 
             while self.running:
                 try:
                     ticker = await self.exchange.fetch_ticker(self.pair)
                     price = ticker['last']
                     
-                    # LOGIC: If price moves UP to next grid -> SELL
+                    # --- TRAILING CHECK (Live) ---
+                    # If Trailing Up enabled and price breaks upper bound
+                    if self.config.strategy.trailing_up and price > self.grid_levels[-1]:
+                        shift = price - self.grid_levels[-1]
+                        self.grid_levels = [l + shift for l in self.grid_levels]
+                        logger.info(f"Bot {self.bot_id}: Trailing UP. New Range: {self.grid_levels[0]:.2f} - {self.grid_levels[-1]:.2f}")
+
+                    # If Trailing Down enabled and price breaks lower bound
+                    if self.config.strategy.trailing_down and price < self.grid_levels[0]:
+                        shift = price - self.grid_levels[0]
+                        self.grid_levels = [l + shift for l in self.grid_levels]
+                        logger.info(f"Bot {self.bot_id}: Trailing DOWN. New Range: {self.grid_levels[0]:.2f} - {self.grid_levels[-1]:.2f}")
+
+                    # Trading Logic (Simplified)
                     if self.last_grid_index < len(self.grid_levels) - 1:
                         next_level = self.grid_levels[self.last_grid_index + 1]
                         if price >= next_level:
@@ -248,7 +283,6 @@ class GridBot:
                             self.last_grid_index += 1
                             continue 
 
-                    # LOGIC: If price moves DOWN to prev grid -> BUY
                     if self.last_grid_index > 0:
                         prev_level = self.grid_levels[self.last_grid_index - 1]
                         if price <= prev_level:
@@ -267,17 +301,8 @@ class GridBot:
 
     async def execute_trade(self, side, price):
         try:
-            amount_usdt = self.config.strategy.investment / self.config.strategy.grids
-            amount = amount_usdt / price 
-            
-            # UNCOMMENT TO EXECUTE REAL TRADES
-            # order = await self.exchange.create_order(self.pair, 'limit', side, amount, price)
-            
+            # Execute real order here...
             logger.info(f"✅ Bot {self.bot_id}: {side.upper()} executed at ${price}")
-            
-            # NOTIFY BACKEND (Webhook)
-            # You should implement the webhook call here as discussed previously
-            
         except Exception as e:
             logger.error(f"Bot {self.bot_id} Trade Failed: {e}")
 
@@ -306,12 +331,9 @@ async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTas
 @app.post("/stop/{bot_id}")
 async def stop_bot_endpoint(bot_id: int):
     if bot_id not in active_bots: raise HTTPException(status_code=404, detail="Bot not found")
-    
     bot_entry = active_bots[bot_id]
     bot_entry["instance"].running = False
-    
     try: await bot_entry["task"]
     except asyncio.CancelledError: pass
-    
     del active_bots[bot_id]
     return {"message": "Bot stopped successfully"}
