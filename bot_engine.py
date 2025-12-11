@@ -1,474 +1,317 @@
-// backend/controllers/userController.js
-const pool = require('../db');
-const jwt = require('jsonwebtoken');
-const axios = require('axios');
-const ccxt = require('ccxt');
-const { encrypt, decrypt } = require('../utils/encryption');
+import asyncio
+import ccxt.async_support as ccxt  
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Optional, List
+import logging
+from datetime import datetime
+import pandas as pd
+import numpy as np
 
-// --- GLOBAL VARIABLES ---
-const TRADING_ENGINE_URL = process.env.TRADING_ENGINE_URL || 'http://localhost:8000';
-const BOT_SECRET = process.env.BOT_SECRET || 'my_super_secure_bot_secret_123';
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("FydEngine")
 
-// ============================================================
-// CONTROLLERS
-// ============================================================
+app = FastAPI(title="FydBlock Trading Engine")
+active_bots: Dict[int, dict] = {}
 
-// @desc    Get current user profile
-const getMe = async (req, res) => {
-    try {
-        const userQuery = await pool.query(
-            'SELECT id, email, full_name, country, phone_number, role FROM users WHERE id = $1',
-            [req.user.id]
-        );
+# --- MODELS ---
+class StrategyConfig(BaseModel):
+    upper_price: Optional[float] = 0  # ✅ Changed to Optional/Default 0
+    lower_price: Optional[float] = 0
+    grids: int
+    investment: float
 
-        if (userQuery.rows.length === 0) {
-            return res.status(404).json({ message: 'User not found' });
-        }
+class BotRequest(BaseModel):
+    bot_id: int
+    user_id: int
+    exchange: str      
+    pair: str          
+    api_key: str
+    api_secret: str
+    passphrase: Optional[str] = None
+    strategy: StrategyConfig
 
-        const user = userQuery.rows[0];
-        const botQuery = await pool.query("SELECT * FROM bots WHERE user_id = $1 AND bot_type != 'SKIPPED'", [req.user.id]);
-        const exchangeQuery = await pool.query('SELECT 1 FROM user_exchanges WHERE user_id = $1 LIMIT 1', [req.user.id]);
+class BacktestConfig(BaseModel):
+    exchange: str = 'binance'
+    pair: str = 'BTC/USDT'
+    timeframe: str = '1h'
+    startDate: str  
+    endDate: str    
+    capital: float
+    upperPrice: Optional[float] = 0 # ✅ Default 0 for Auto-Calculation
+    lowerPrice: Optional[float] = 0
+    gridSize: int
 
-        res.json({
-            user: user,
-            profileComplete: !!user.full_name,
-            botCreated: botQuery.rows.length > 0,
-            hasExchange: exchangeQuery.rows.length > 0
-        });
+# --- BACKTESTER ---
+class Backtester:
+    def __init__(self, config: BacktestConfig):
+        self.config = config
+        self.exchange_id = config.exchange.lower()
+        self.pair = config.pair
+        self.timeframe = config.timeframe
+        self.start_date = config.startDate
+        self.end_date = config.endDate 
+        self.initial_balance = config.capital
+        self.upper_price = config.upperPrice
+        self.lower_price = config.lowerPrice
+        self.grids = config.gridSize
 
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Update User Profile
-const updateProfile = async (req, res) => {
-    const { full_name, country, phone } = req.body;
-    try {
-        const updatedUser = await pool.query(
-            'UPDATE users SET full_name = $1, country = $2, phone_number = $3 WHERE id = $4 RETURNING *',
-            [full_name, country, phone, req.user.id]
-        );
-        res.json(updatedUser.rows[0]);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Add Exchange Key
-const addExchange = async (req, res) => {
-    const { exchange_name, api_key, api_secret, passphrase } = req.body;
-
-    try {
-        const exchangeId = exchange_name.toLowerCase();
-        if (ccxt[exchangeId]) {
-            const exchange = new ccxt[exchangeId]({ apiKey: api_key, secret: api_secret, password: passphrase });
-        }
-
-        const encryptedKey = encrypt(api_key);
-        const encryptedSecret = encrypt(api_secret);
-        const encryptedPassphrase = passphrase ? encrypt(passphrase) : null;
-
-        const newExchange = await pool.query(
-            'INSERT INTO user_exchanges (user_id, exchange_name, api_key, api_secret, passphrase, connection_type) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [req.user.id, exchange_name, encryptedKey, encryptedSecret, encryptedPassphrase, 'manual']
-        );
-
-        res.json(newExchange.rows[0]);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-const authExchange = (req, res) => { res.status(501).json({ message: "OAuth not implemented" }); };
-const authExchangeCallback = async (req, res) => { res.redirect(`${process.env.FRONTEND_URL}/dashboard`); };
-
-// @desc    Create Bot
-const createBot = async (req, res) => {
-    const { bot_name, quote_currency, bot_type, plan, billing_cycle, description, config, icon, status } = req.body;
-
-    try {
-        if (plan) {
-            await pool.query(
-                'INSERT INTO subscriptions (user_id, plan_type, billing_cycle) VALUES ($1, $2, $3)',
-                [req.user.id, plan, billing_cycle]
-            );
-        }
-
-        const exchange = await pool.query(
-            'SELECT exchange_id FROM user_exchanges WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
-            [req.user.id]
-        );
-        const exchangeId = exchange.rows.length > 0 ? exchange.rows[0].exchange_id : null;
-
-        const configStr = typeof config === 'object' ? JSON.stringify(config) : config;
-
-        const newBot = await pool.query(
-            `INSERT INTO bots 
-            (user_id, exchange_connection_id, bot_name, quote_currency, bot_type, status, description, config, icon_url) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-            RETURNING *`,
-            [
-                req.user.id, exchangeId, bot_name || 'My Bot', quote_currency || 'USDT', 
-                bot_type, status || 'ready', description, configStr, icon
-            ]
-        );
-
-        res.json(newBot.rows[0]);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Update Bot
-const updateBot = async (req, res) => {
-    const { id } = req.params;
-    const { bot_name, bot_type, status, description, config, icon } = req.body;
-
-    try {
-        const configStr = typeof config === 'object' ? JSON.stringify(config) : config;
-
-        const updatedBot = await pool.query(
-            `UPDATE bots 
-             SET bot_name = $1, bot_type = $2, status = $3, description = $4, config = $5, icon_url = $6
-             WHERE bot_id = $7 AND user_id = $8
-             RETURNING *`,
-            [bot_name, bot_type, status, description, configStr, icon, id, req.user.id]
-        );
-
-        if (updatedBot.rows.length === 0) {
-            return res.status(404).json({ message: 'Bot not found or unauthorized' });
-        }
-
-        res.json(updatedBot.rows[0]);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Delete Bot
-const deleteBot = async (req, res) => {
-    try {
-        const { id } = req.params;
-        try {
-            await axios.post(`${TRADING_ENGINE_URL}/stop/${id}`);
-        } catch (e) { /* Ignore */ }
-
-        const result = await pool.query(
-            'DELETE FROM bots WHERE bot_id = $1 AND user_id = $2 RETURNING *',
-            [id, req.user.id]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ message: 'Bot not found' });
-        }
-
-        res.json({ message: 'Bot removed' });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Get Dashboard Data
-const getDashboard = async (req, res) => {
-    try {
-        const botsQuery = await pool.query(
-            "SELECT * FROM bots WHERE user_id = $1 AND bot_type != 'SKIPPED' ORDER BY created_at DESC",
-            [req.user.id]
-        );
-
-        res.json({ 
-            stats: [
-                { title: "Today's Profit", value: "$0.00", percentage: "0.00%", isPositive: true },
-                { title: "30 Days Profit", value: "$0.00", percentage: "0.00%", isPositive: true },
-                { title: "Assets Value", value: "$0.00", percentage: "0.00%", isPositive: true },
-            ], 
-            bots: botsQuery.rows 
-        });
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Get User Bots
-const getUserBots = async (req, res) => {
-    try {
-        const botsQuery = await pool.query(
-            "SELECT * FROM bots WHERE user_id = $1 AND status != 'archived' AND bot_type != 'SKIPPED' ORDER BY created_at DESC",
-            [req.user.id]
-        );
-
-        const enrichedBots = botsQuery.rows.map(bot => ({
-            ...bot,
-            total_profit: (Math.random() * 100).toFixed(2), // Replace with real stats later
-            invested_capital: (Math.random() * 1000 + 100).toFixed(2),
-            is_running: bot.status === 'running' || bot.status === 'active'
-        }));
-
-        res.json(enrichedBots);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Get System Bots
-const getAvailableBots = async (req, res) => {
-    try {
-        const query = `
-            SELECT b.* FROM bots b
-            JOIN users u ON b.user_id = u.id
-            WHERE u.role = 'admin' AND b.status = 'active'
-            ORDER BY b.created_at DESC
-        `;
-        const result = await pool.query(query);
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err.message);
-        res.status(500).send('Server Error');
-    }
-};
-
-// @desc    Get Real-Time Portfolio (Live Balance + DB History)
-const getPortfolio = async (req, res) => {
-    try {
-        // 1. Get Keys
-        const keysQuery = await pool.query('SELECT * FROM user_exchanges WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1', [req.user.id]);
+    async def fetch_historical_data(self):
+        exchange_class = getattr(ccxt, self.exchange_id)
+        exchange = exchange_class({'enableRateLimit': True})
         
-        if (keysQuery.rows.length === 0) {
-            return res.json({ totalValue: 0, changePercent: 0, assets: [], history: [] });
-        }
+        try:
+            start_ts = exchange.parse8601(f"{self.start_date}T00:00:00Z")
+            end_ts = exchange.parse8601(f"{self.end_date}T23:59:59Z")
 
-        const exchangeData = keysQuery.rows[0];
-        const exchangeId = exchangeData.exchange_name.toLowerCase();
-        
-        let apiKey, apiSecret, password;
-        try {
-            apiKey = decrypt(exchangeData.api_key);
-            apiSecret = decrypt(exchangeData.api_secret);
-            password = exchangeData.passphrase ? decrypt(exchangeData.passphrase) : undefined;
-        } catch (e) {
-            return res.status(500).json({ message: "Key Error" });
-        }
-
-        if (!ccxt[exchangeId]) return res.status(400).json({ message: 'Exchange not supported' });
-
-        const exchange = new ccxt[exchangeId]({ apiKey, secret: apiSecret, password, enableRateLimit: true });
-        
-        // 2. Fetch Balance (Live from Exchange)
-        let balances = {};
-        try {
-            const trading = await exchange.fetchBalance();
-            if (trading.total) {
-                Object.entries(trading.total).forEach(([s, a]) => { 
-                    if (a > 0) balances[s] = a; 
-                });
-            }
-        } catch (e) {
-            console.error("CCXT Balance Error:", e.message);
-            // Even if fetch fails, try to show history from DB
-        }
-
-        const assetsList = Object.entries(balances).map(([s, b]) => ({ symbol: s, balance: b }));
-
-        // 3. Fetch Prices (Live from Exchange)
-        let tickers = {};
-        try {
-            const symbolsToFetch = assetsList
-                .filter(a => !['USDT', 'USDC', 'BUSD', 'DAI'].includes(a.symbol.toUpperCase()))
-                .map(a => `${a.symbol}/USDT`);
+            all_ohlcv = []
+            current_since = start_ts
             
-            if (symbolsToFetch.length > 0) {
-                tickers = await exchange.fetchTickers(symbolsToFetch);
-            }
-        } catch (e) { console.error("Ticker Error:", e.message); }
+            while current_since < end_ts:
+                ohlcv = await exchange.fetch_ohlcv(self.pair, self.timeframe, current_since, limit=1000)
+                if not ohlcv: break
+                
+                batch = [c for c in ohlcv if c[0] <= end_ts]
+                all_ohlcv += batch
+                
+                last_time = ohlcv[-1][0]
+                if last_time == current_since: break 
+                current_since = last_time + 1 
+                
+                if last_time >= end_ts: break
 
-        // 4. Calculate Total & Assets
-        let totalValue = 0;
-        let totalPreviousValue = 0;
+            return all_ohlcv
+        finally:
+            await exchange.close()
+
+    async def run(self):
+        logger.info(f"Running backtest for {self.pair}...")
+        ohlcv = await self.fetch_historical_data()
         
-        const enrichedAssets = assetsList.map(asset => {
-            let price = 0;
-            let change24h = 0;
+        if not ohlcv:
+            return {"status": "error", "message": "No historical data found"}
 
-            if (['USDT', 'USDC', 'DAI', 'BUSD'].includes(asset.symbol.toUpperCase())) {
-                price = 1.0;
-            } else {
-                const pair = `${asset.symbol}/USDT`;
-                if (tickers[pair]) {
-                    price = tickers[pair].last;
-                    change24h = tickers[pair].percentage;
-                }
-            }
+        # ✅ AUTO-CALCULATION FOR BACKTEST
+        # If user didn't provide prices (sent 0), calculate based on FIRST CANDLE
+        first_close = ohlcv[0][4] # [timestamp, open, high, low, close, vol]
+        
+        if self.upper_price == 0 or self.lower_price == 0:
+            logger.info(f"Auto-calculating range based on start price: ${first_close}")
+            self.upper_price = first_close * 1.10 # +10%
+            self.lower_price = first_close * 0.90 # -10%
+
+        step = (self.upper_price - self.lower_price) / self.grids
+        grid_levels = [self.lower_price + (i * step) for i in range(self.grids + 1)]
+        
+        balance_usdt = self.initial_balance
+        balance_asset = 0
+        cumulative_grid_profit = 0
+        
+        trade_history = []
+        chart_data = []
+        
+        active_grids = {i: False for i in range(len(grid_levels))}
+        investment_per_grid = self.initial_balance / self.grids
+
+        # Downsampling for performance if data is huge
+        skip_step = max(1, len(ohlcv) // 1000) 
+
+        for index, candle in enumerate(ohlcv):
+            timestamp, open_, high, low, close, volume = candle
+            date_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M')
+            action = None
             
-            const val = asset.balance * price;
-            totalValue += val;
+            for i, level in enumerate(grid_levels):
+                # BUY
+                if low < level and not active_grids[i]:
+                    if balance_usdt >= investment_per_grid:
+                        amount = investment_per_grid / level
+                        balance_usdt -= investment_per_grid
+                        balance_asset += amount
+                        active_grids[i] = True
+                        action = 'buy'
+                        trade_history.append({
+                            "time": date_str, "type": "Buy", "price": level, "amount": amount, "profit": 0
+                        })
 
-            // Estimate previous value for percentage calc
-            if (change24h !== undefined) {
-                const prevPrice = price / (1 + (change24h / 100));
-                totalPreviousValue += (asset.balance * prevPrice);
-            } else {
-                totalPreviousValue += val;
-            }
+                # SELL
+                elif high > (level + step) and active_grids[i]:
+                    if balance_asset > 0:
+                        amount = investment_per_grid / level 
+                        revenue = amount * (level + step)
+                        profit = revenue - investment_per_grid
+                        balance_usdt += revenue
+                        balance_asset -= amount
+                        cumulative_grid_profit += profit
+                        active_grids[i] = False
+                        action = 'sell'
+                        trade_history.append({
+                            "time": date_str, "type": "Sell", "price": level + step, "amount": amount, "profit": profit
+                        })
+
+            # Record Data
+            if index % skip_step == 0 or action:
+                current_asset_value = balance_asset * close
+                total_equity = balance_usdt + current_asset_value
+                
+                chart_data.append({
+                    "date": date_str, 
+                    "price": close, 
+                    "totalValue": total_equity, 
+                    "assetValue": current_asset_value, 
+                    "gridProfit": cumulative_grid_profit, 
+                    "action": action
+                })
+
+        # Final Stats
+        final_price = ohlcv[-1][4]
+        current_asset_value = balance_asset * final_price
+        total_equity = balance_usdt + current_asset_value
+        total_profit = total_equity - self.initial_balance
+        roi = (total_profit / self.initial_balance) * 100
+        
+        return {
+            "status": "success",
+            "stats": {
+                "totalProfit": round(total_profit, 2),
+                "gridProfit": round(cumulative_grid_profit, 2),
+                "roi": round(roi, 2),
+                "totalTrades": len(trade_history)
+            },
+            "history": trade_history,
+            "chartData": chart_data 
+        }
+
+# --- LIVE BOT ---
+class GridBot:
+    def __init__(self, config: BotRequest):
+        self.bot_id = config.bot_id
+        self.pair = config.pair
+        self.config = config
+        self.exchange = None
+        self.running = False
+        self.grid_levels = []
+        self.last_grid_index = -1 
+
+    async def initialize_exchange(self):
+        exchange_class = getattr(ccxt, self.config.exchange.lower())
+        self.exchange = exchange_class({
+            'apiKey': self.config.api_key,
+            'secret': self.config.api_secret,
+            'password': self.config.passphrase,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'} 
+        })
+        await self.exchange.load_markets()
+
+    async def calculate_grids(self):
+        # ✅ AUTO-CALCULATION FOR LIVE BOT
+        # If prices are 0, fetch current market price and set range
+        if self.config.strategy.upper_price == 0 or self.config.strategy.lower_price == 0:
+            ticker = await self.exchange.fetch_ticker(self.pair)
+            current_price = ticker['last']
+            logger.info(f"Bot {self.bot_id}: Auto-setting range based on current price: ${current_price}")
+            self.config.strategy.upper_price = current_price * 1.10
+            self.config.strategy.lower_price = current_price * 0.90
+
+        upper = self.config.strategy.upper_price
+        lower = self.config.strategy.lower_price
+        count = self.config.strategy.grids
+        
+        step = (upper - lower) / count
+        self.grid_levels = [lower + (i * step) for i in range(count + 1)]
+        logger.info(f"Bot {self.bot_id} Grids set: {lower} to {upper} (Step: {step})")
+
+    async def run(self):
+        self.running = True
+        logger.info(f"🚀 Live Bot {self.bot_id} Started")
+        try:
+            await self.initialize_exchange()
+            await self.calculate_grids()
             
-            return {
-                symbol: asset.symbol.toUpperCase(), 
-                balance: asset.balance, 
-                price, 
-                value: val,
-                change: change24h ? parseFloat(change24h.toFixed(2)) : 0
-            };
-        });
+            ticker = await self.exchange.fetch_ticker(self.pair)
+            current_price = ticker['last']
+            
+            # Find closest grid level to start
+            self.last_grid_index = min(range(len(self.grid_levels)), key=lambda i: abs(self.grid_levels[i] - current_price))
 
-        enrichedAssets.sort((a, b) => b.value - a.value);
+            while self.running:
+                try:
+                    ticker = await self.exchange.fetch_ticker(self.pair)
+                    price = ticker['last']
+                    
+                    # LOGIC: If price moves UP to next grid -> SELL
+                    if self.last_grid_index < len(self.grid_levels) - 1:
+                        next_level = self.grid_levels[self.last_grid_index + 1]
+                        if price >= next_level:
+                            await self.execute_trade('sell', price)
+                            self.last_grid_index += 1
+                            continue 
 
-        let changePercent = 0;
-        if (totalPreviousValue > 0) {
-            changePercent = ((totalValue - totalPreviousValue) / totalPreviousValue) * 100;
-        }
+                    # LOGIC: If price moves DOWN to prev grid -> BUY
+                    if self.last_grid_index > 0:
+                        prev_level = self.grid_levels[self.last_grid_index - 1]
+                        if price <= prev_level:
+                            await self.execute_trade('buy', price)
+                            self.last_grid_index -= 1
+                            continue
+                            
+                    await asyncio.sleep(2) 
+                except Exception as e:
+                    logger.error(f"Bot {self.bot_id} Loop Error: {e}")
+                    await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Bot {self.bot_id} Critical Failure: {e}")
+        finally:
+            if self.exchange: await self.exchange.close()
 
-        // 5. GET CHART HISTORY (Using 'recorded_at')
-        let historyData = [];
-        try {
-            // Query the snapshots table
-            const historyQuery = await pool.query(
-                `SELECT total_value FROM portfolio_snapshots 
-                 WHERE user_id = $1 
-                 ORDER BY recorded_at DESC 
-                 LIMIT 24`, 
-                [req.user.id]
-            );
+    async def execute_trade(self, side, price):
+        try:
+            amount_usdt = self.config.strategy.investment / self.config.strategy.grids
+            amount = amount_usdt / price 
+            
+            # UNCOMMENT TO EXECUTE REAL TRADES
+            # order = await self.exchange.create_order(self.pair, 'limit', side, amount, price)
+            
+            logger.info(f"✅ Bot {self.bot_id}: {side.upper()} executed at ${price}")
+            
+            # NOTIFY BACKEND (Webhook)
+            # You should implement the webhook call here as discussed previously
+            
+        except Exception as e:
+            logger.error(f"Bot {self.bot_id} Trade Failed: {e}")
 
-            if (historyQuery.rows.length > 0) {
-                // Reverse to get [Oldest ... Newest]
-                historyData = historyQuery.rows.map(r => parseFloat(r.total_value)).reverse();
-            }
-        } catch (e) { 
-            console.error("DB History Error:", e.message);
-        }
+@app.get("/")
+def health_check(): return {"status": "online", "active_bots": len(active_bots)}
 
-        // If we have live data, append it as the most recent point
-        if (totalValue > 0) {
-            historyData.push(totalValue);
-        }
+@app.post("/backtest")
+async def run_backtest_endpoint(config: BacktestConfig):
+    try:
+        backtester = Backtester(config)
+        return await backtester.run()
+    except Exception as e:
+        logger.error(f"Backtest failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        // Fallback if DB is empty: Generate simulated line
-        if (historyData.length < 2) {
-            historyData = generateSimulatedChart(totalValue, changePercent);
-        }
+@app.post("/start")
+async def start_bot_endpoint(config: BotRequest, background_tasks: BackgroundTasks):
+    if config.bot_id in active_bots: raise HTTPException(status_code=400, detail="Bot already running")
+    
+    bot = GridBot(config)
+    task = asyncio.create_task(bot.run())
+    active_bots[config.bot_id] = { "instance": bot, "task": task, "config": config.dict() }
+    
+    return {"message": "Bot started successfully", "bot_id": config.bot_id}
 
-        res.json({ 
-            totalValue, 
-            changePercent: parseFloat(changePercent.toFixed(2)), 
-            assets: enrichedAssets, 
-            history: historyData 
-        });
-
-    } catch (err) {
-        console.error("Portfolio Error:", err);
-        res.status(500).send('Server Error');
-    }
-};
-
-// --- HELPER: Simulate Chart if no history ---
-const generateSimulatedChart = (currentValue, changePercent) => {
-    if (currentValue === 0) return [0, 0, 0, 0, 0];
-    const prevValue = currentValue / (1 + (changePercent / 100));
-    const points = 24;
-    const data = [];
-    for (let i = 0; i < points; i++) {
-        const progress = i / (points - 1);
-        const base = prevValue + (currentValue - prevValue) * progress;
-        const noise = (Math.random() - 0.5) * (currentValue * 0.01);
-        if (i === 0) data.push(prevValue);
-        else if (i === points - 1) data.push(currentValue);
-        else data.push(base + noise);
-    }
-    return data;
-};
-
-// @desc    Public Market Data - MODIFIED to return Ticker and Order Book data
-const getMarketData = async (req, res) => {
-    const { exchange: exchangeId, symbol } = req.query;
-    if (!exchangeId || !symbol) return res.status(400).json({ message: 'Missing parameters' });
-
-    try {
-        if (!ccxt[exchangeId.toLowerCase()]) return res.status(400).json({ message: 'Exchange not supported' });
-        const exchange = new ccxt[exchangeId.toLowerCase()]();
-        
-        // 1. Fetch Ticker (for current market price)
-        const ticker = await exchange.fetchTicker(symbol); 
-        
-        // 2. Fetch Order Book (only 5 deep for faster generic price check)
-        // This is used to calculate mid-price on the frontend
-        const orderBook = await exchange.fetchOrderBook(symbol, 5); 
-
-        // Return current price, top bid/ask for accurate mid-price calculation
-        res.json({ 
-            symbol, 
-            price: ticker.last, // The current price from the last trade
-            bid: orderBook.bids.length > 0 ? orderBook.bids[0][0] : null, // Top bid price
-            ask: orderBook.asks.length > 0 ? orderBook.asks[0][0] : null, // Top ask price
-            timestamp: Date.now() 
-        });
-
-    } catch (err) {
-        console.error("Market Data Fetch Error:", err.message);
-        res.status(500).json({ message: 'Failed to fetch live market data' });
-    }
-};
-
-// --- PYTHON INTEGRATION ---
-const executeTradeSignal = async (req, res) => {
-    const { secret, userId, exchange: exchangeName, symbol, side, amount, type } = req.body;
-    if (secret !== BOT_SECRET) return res.status(401).json({ message: "Unauthorized" });
-
-    try {
-        const keysQuery = await pool.query(
-            'SELECT * FROM user_exchanges WHERE user_id = $1 AND exchange_name = $2 LIMIT 1',
-            [userId, exchangeName]
-        );
-        if (keysQuery.rows.length === 0) return res.status(404).json({ message: "Keys not found" });
-
-        const exchangeData = keysQuery.rows[0];
-        const apiKey = decrypt(exchangeData.api_key);
-        const apiSecret = decrypt(exchangeData.api_secret);
-        const password = exchangeData.passphrase ? decrypt(exchangeData.passphrase) : undefined;
-
-        const exchange = new ccxt[exchangeData.exchange_name.toLowerCase()]({ apiKey, secret: apiSecret, password, enableRateLimit: true });
-        const order = await exchange.createOrder(symbol, type || 'market', side, amount);
-
-        res.json({ success: true, orderId: order.id, details: order });
-    } catch (err) {
-        res.status(500).json({ message: err.message });
-    }
-};
-
-const runBacktest = async (req, res) => {
-    try {
-        const { pair, startDate, endDate, capital, upperPrice, lowerPrice, gridSize } = req.body;
-        const response = await axios.post(`${TRADING_ENGINE_URL}/backtest`, {
-            exchange: 'binance', pair, startDate, endDate, capital, upperPrice, lowerPrice, gridSize
-        });
-        res.json(response.data);
-    } catch (err) {
-        res.status(500).json({ message: "Backtest simulation failed" });
-    }
-};
-
-const getBacktests = async (req, res) => { res.json([]); };
-const saveBacktest = async (req, res) => { res.json({ message: "Backtest saved" }); };
-
-module.exports = { 
-    getMe, updateProfile, addExchange, createBot, updateBot, deleteBot, getAvailableBots, 
-    authExchange, authExchangeCallback, getDashboard, getPortfolio, 
-    getUserBots, getMarketData, executeTradeSignal, runBacktest, getBacktests, saveBacktest   
-};
+@app.post("/stop/{bot_id}")
+async def stop_bot_endpoint(bot_id: int):
+    if bot_id not in active_bots: raise HTTPException(status_code=404, detail="Bot not found")
+    
+    bot_entry = active_bots[bot_id]
+    bot_entry["instance"].running = False
+    
+    try: await bot_entry["task"]
+    except asyncio.CancelledError: pass
+    
+    del active_bots[bot_id]
+    return {"message": "Bot stopped successfully"}
